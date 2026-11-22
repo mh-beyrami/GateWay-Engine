@@ -5,6 +5,7 @@ import engineRoutes from './routes/engine.routes.js';
 import { proxyHandler } from './proxy/proxy.handler.js';
 import { errorHandler } from './middlewares/error.middleware.js';
 import { envConfig } from './config/env.config.js';
+import { isBlockedAdUrl } from './utils/ad-blocker.js';
 
 const app = express();
 
@@ -13,7 +14,10 @@ app.set('views', path.join(process.cwd(), 'views'));
 
 app.use('/__static', express.static(path.join(process.cwd(), 'public')));
 
-app.use('/__p', proxyHandler);
+app.use('/__p', (req, res, next) => {
+    if (isBlockedAdUrl(req.originalUrl.slice('/__p/'.length))) return res.status(204).end();
+    next();
+}, proxyHandler);
 
 app.use((req, res, next) => {
     const referer = req.headers.referer || '';

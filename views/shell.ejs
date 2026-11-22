@@ -4,24 +4,42 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
     <title>Gateway Engine Core</title>
+    <link rel="stylesheet" href="/__static/css/persian-font.css">
     <link rel="stylesheet" href="/__static/css/shell.css">
 </head>
 <body>
-    <iframe id="gateway-view" src="/__newtab" title="Gateway content"></iframe>
+    <iframe id="gateway-view" src="/__newtab" title="Gateway content" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"></iframe>
 
     <div id="__engine_bar__" style="display: none;">
-        <button type="button" id="back-button" aria-label="Back">◀</button>
-        <button type="button" id="forward-button" aria-label="Forward">▶</button>
+        <button type="button" id="back-button" aria-label="بازگشت" title="بازگشت"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19 12H5m0 0 6-6m-6 6 6 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
+        <button type="button" id="forward-button" aria-label="جلو" title="جلو"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M5 12h14m0 0-6-6m6 6-6 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <form id="engine-form">
-            <input type="text" id="engine-input" placeholder="Search or type URL..." autocomplete="off" aria-label="Search or type URL">
+            <svg class="address-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M4 12h16M12 4c2.5 2.4 3.5 5.1 3.5 8S14.5 17.6 12 20c-2.5-2.4-3.5-5.1-3.5-8S9.5 6.4 12 4Z" stroke="currentColor" stroke-width="1.3"/></svg>
+            <input type="text" id="engine-input" dir="auto" placeholder="جست‌وجو یا وارد کردن آدرس..." autocomplete="off" aria-label="جست‌وجو یا وارد کردن آدرس">
         </form>
-        <button type="button" class="home-btn" id="home-button">Home</button>
+        <button type="button" class="home-btn" id="home-button" aria-label="صفحهٔ شروع" title="صفحهٔ شروع"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span>خانه</span></button>
     </div>
 
     <script>
         const view = document.getElementById('gateway-view');
         const input = document.getElementById('engine-input');
         const engineBar = document.getElementById('__engine_bar__');
+
+        function unwrapTarget(value) {
+            let target = String(value);
+            for (let i = 0; i < 20; i++) {
+                if (target.startsWith('/__p/')) {
+                    target = target.slice(5);
+                } else {
+                    let url;
+                    try { url = new URL(target); } catch { break; }
+                    if (url.origin !== location.origin || !url.pathname.startsWith('/__p/')) break;
+                    target = url.pathname.slice(5) + url.search + url.hash;
+                }
+                target = target.replace(/^(https?):\/(?!\/)/i, '$1://');
+            }
+            return target;
+        }
 
         function updateEngineBar() {
             try {
@@ -30,8 +48,7 @@
                     input.value = '';
                     engineBar.style.display = 'none';
                 } else if (href.includes('/__p/')) {
-                    const target = href.split('/__p/').slice(1).join('/__p/');
-                    input.value = decodeURI(target);
+                    input.value = unwrapTarget(href);
                     engineBar.style.display = 'flex';
                 }
             } catch {}
@@ -40,9 +57,7 @@
         view.addEventListener('load', updateEngineBar);
 
         async function navigateTo(target) {
-            if (typeof target === 'string' && target.startsWith('/__p/')) {
-                target = target.replace(/^\/__p\//, '');
-            }
+            if (typeof target === 'string') target = unwrapTarget(target);
             try {
                 const res = await fetch('/__engine/set-target', {
                     method: 'POST',
@@ -51,6 +66,10 @@
                 });
                 const data = await res.json();
                 if (data.success) {
+                    if (data.displayUrl) {
+                        input.value = unwrapTarget(data.displayUrl);
+                        engineBar.style.display = 'flex';
+                    }
                     view.src = data.url;
                 }
             } catch {}
@@ -72,7 +91,11 @@
         document.getElementById('home-button').addEventListener('click', () => navigateTo('MAIN'));
 
         window.addEventListener('message', (e) => {
-            if (e.data && e.data.type === 'ENGINE_NAV') {
+            if (e.source !== view.contentWindow || !e.data) return;
+            if (e.data.type === 'ENGINE_URL') {
+                input.value = unwrapTarget(e.data.target);
+                engineBar.style.display = 'flex';
+            } else if (e.data.type === 'ENGINE_NAV') {
                 navigateTo(e.data.target);
             }
         });

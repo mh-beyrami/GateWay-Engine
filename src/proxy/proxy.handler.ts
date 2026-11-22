@@ -1,6 +1,7 @@
 import { Request, Response } from 'express';
 import { createProxyMiddleware, responseInterceptor } from 'http-proxy-middleware';
 import { envConfig } from '../config/env.config.js';
+import { isBlockedAdUrl } from '../utils/ad-blocker.js';
 
 const proxiedPath = '/__p/';
 const systemPrefixes = ['/__p/', '/__engine/', '/__static/'];
@@ -37,6 +38,12 @@ const getTargetUrl = (req: Request): URL | null => {
     const encodedTarget = (req.originalUrl || req.url || '').replace(/^\/__p\//, '');
     try {
         const target = new URL(encodedTarget);
+        // The legacy links host returns an empty script for paginated results.
+        // Request the same endpoint on DuckDuckGo's primary HTTPS host instead.
+        if (target.hostname === 'links.duckduckgo.com' && target.pathname === '/d.js') {
+            target.protocol = 'https:';
+            target.hostname = 'duckduckgo.com';
+        }
         if (target.protocol === 'http:' || target.protocol === 'https:') return target;
     } catch {}
     
@@ -54,11 +61,44 @@ const getTargetUrl = (req: Request): URL | null => {
 const getInjectedScript = (currentUrl: string): string => `
 <script>
 (function () {
-    const currentUrl = ${JSON.stringify(currentUrl)};
+    const initialUrl = ${JSON.stringify(currentUrl)};
     const systemPrefixes = ${JSON.stringify(systemPrefixes)};
 
+    // Keep sites from opening advertising windows outside the embedded view.
+    window.open = function () { return null; };
+
+    function unwrap(value) {
+        let result = String(value);
+        for (let i = 0; i < 20; i++) {
+            if (result.startsWith('/__p/')) {
+                result = result.slice(5);
+            } else {
+                let parsed;
+                try { parsed = new URL(result); } catch { break; }
+                if (parsed.origin !== location.origin || !parsed.pathname.startsWith('/__p/')) break;
+                result = parsed.pathname.slice(5) + parsed.search + parsed.hash;
+            }
+            if (result.startsWith('https:/') && !result.startsWith('https://')) result = 'https://' + result.slice(7);
+            if (result.startsWith('http:/') && !result.startsWith('http://')) result = 'http://' + result.slice(6);
+        }
+        return result;
+    }
+
+    function currentUrl() {
+        const target = unwrap(location.href);
+        return (target.startsWith('http://') || target.startsWith('https://')) && target !== location.href ? target : initialUrl;
+    }
+
     function resolveUrl(value) {
-        try { return new URL(value, currentUrl).href; } catch { return null; }
+        try {
+            const resolved = new URL(unwrap(value), currentUrl());
+            // Request objects and site libraries can turn root-relative paths into
+            // absolute gateway URLs before fetch/XHR sees them.
+            if (resolved.origin === location.origin && !systemPrefixes.some((prefix) => resolved.pathname.startsWith(prefix))) {
+                return new URL(resolved.pathname + resolved.search + resolved.hash, new URL(currentUrl()).origin).href;
+            }
+            return resolved.href;
+        } catch { return null; }
     }
 
     function isIgnored(value) {
@@ -66,7 +106,9 @@ const getInjectedScript = (currentUrl: string): string => `
     }
 
     function proxify(value) {
-        if (isIgnored(value) || systemPrefixes.some((prefix) => value.startsWith(prefix))) return value;
+        if (isIgnored(value)) return value;
+        if (value.startsWith('/__p/')) return '/__p/' + unwrap(value);
+        if (systemPrefixes.some((prefix) => value.startsWith(prefix))) return value;
         if (value.startsWith('//')) return '/__p/https:' + value;
         const resolved = resolveUrl(value);
         return resolved ? '/__p/' + resolved : value;
@@ -78,30 +120,29 @@ const getInjectedScript = (currentUrl: string): string => `
     }
 
     document.addEventListener('click', function (event) {
+        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
         const link = event.target.closest('a');
-        if (!link || !link.hasAttribute('href')) return;
+        if (!link || !link.hasAttribute('href') || link.hasAttribute('download')) return;
         const href = link.getAttribute('href');
-        if (isIgnored(href) || href.startsWith('/__p/')) return;
+        if (isIgnored(href)) return;
         
         event.preventDefault();
-        event.stopImmediatePropagation();
         navigate(href);
-    }, true);
+    });
 
     document.addEventListener('submit', function (event) {
         const form = event.target.closest('form');
-        if (!form) return;
+        if (!form || event.defaultPrevented || (form.method || 'get').toLowerCase() !== 'get') return;
         
         event.preventDefault();
-        event.stopImmediatePropagation();
         
         try {
-            const action = new URL(form.getAttribute('action') || '', currentUrl);
+            const action = new URL(unwrap(form.getAttribute('action') || ''), currentUrl());
             const params = new URLSearchParams(new FormData(form));
             params.forEach((value, key) => action.searchParams.set(key, value));
             navigate(action.href);
         } catch {}
-    }, true);
+    });
 
     const nativeSetAttribute = Element.prototype.setAttribute;
     Element.prototype.setAttribute = function (name, value) {
@@ -137,14 +178,22 @@ const getInjectedScript = (currentUrl: string): string => `
     const originalPushState = history.pushState;
     history.pushState = function(state, unused, url) {
         if (url) url = proxify(url.toString());
-        return originalPushState.call(this, state, unused, url);
+        const result = originalPushState.call(this, state, unused, url);
+        window.parent.postMessage({ type: 'ENGINE_URL', target: currentUrl() }, '*');
+        return result;
     };
 
     const originalReplaceState = history.replaceState;
     history.replaceState = function(state, unused, url) {
         if (url) url = proxify(url.toString());
-        return originalReplaceState.call(this, state, unused, url);
+        const result = originalReplaceState.call(this, state, unused, url);
+        window.parent.postMessage({ type: 'ENGINE_URL', target: currentUrl() }, '*');
+        return result;
     };
+
+    window.addEventListener('popstate', function () {
+        window.parent.postMessage({ type: 'ENGINE_URL', target: currentUrl() }, '*');
+    });
 
     const originalXHROpen = XMLHttpRequest.prototype.open;
     XMLHttpRequest.prototype.open = function (method, url, ...rest) {
@@ -158,6 +207,8 @@ const getInjectedScript = (currentUrl: string): string => `
     window.fetch = function (...args) {
         if (typeof args[0] === 'string') {
             args[0] = proxify(args[0]);
+        } else if (args[0] instanceof URL) {
+            args[0] = proxify(args[0].href);
         } else if (args[0] && args[0] instanceof Request) {
             try {
                 args[0] = new Request(proxify(args[0].url), args[0]);
@@ -169,7 +220,7 @@ const getInjectedScript = (currentUrl: string): string => `
 </script>`;
 
 const rewriteCssUrls = (css: string, targetOrigin: string): string => css.replace(
-    /url\(\s*(['"]?)(\/(?!\/\vert{}__p\/\vert{}__engine\/\vert{}__static\/)[^'")]*)\1\s*\)/gi,
+    /url\(\s*(['"]?)(\/(?!\/|__p\/|__engine\/|__static\/)[^'")]*)\1\s*\)/gi,
     (_, quote: string, path: string) => `url(${quote}${proxiedPath}${targetOrigin}${path}${quote})`
 );
 
@@ -198,13 +249,45 @@ const rewriteHtmlPaths = (html: string, targetOrigin: string): string => {
 };
 
 const rewriteResponse = (html: string, target: URL): string => {
-    const rewritten = rewriteHtmlPaths(html.replace(/integrity=(['"]).*?\1/gi, ''), target.origin);
-    const injection = getInjectedScript(target.href);
+    const withoutAdScripts = html.replace(/<script\b[^>]*\bsrc\s*=\s*(["'])(.*?)\1[^>]*>\s*<\/script\s*>/gi,
+        (tag, _quote: string, src: string) => {
+            try { return isBlockedAdUrl(new URL(src, target).href) ? '' : tag; } catch { return tag; }
+        });
+    const rewritten = rewriteHtmlPaths(withoutAdScripts.replace(/integrity=(['"]).*?\1/gi, ''), target.origin);
+    const fontInjection = `
+<style>
+#myAdBanner, ins.adsbygoogle, ins[id="1085018"], [data-ad-slot] { display: none !important; }
+@font-face {
+    font-family: 'Gateway Vazirmatn';
+    src: url('/__static/fonts/vazirmatn-arabic-wght-normal.woff2') format('woff2');
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    unicode-range: U+0600-06FF, U+0750-077F, U+0870-0891, U+0897-08FF, U+FB50-FDFF, U+FE70-FEFC;
+}
+</style>
+<script src="/__static/js/persian-font.js"></script>`;
+    const injection = fontInjection + getInjectedScript(target.href);
 
     if (/<head\b[^>]*>/i.test(rewritten)) return rewritten.replace(/(<head\b[^>]*>)/i, `$1\n${injection}`);
     if (/<html\b[^>]*>/i.test(rewritten)) return rewritten.replace(/(<html\b[^>]*>)/i, `$1\n<head>${injection}</head>`);
     return `${injection}\n${rewritten}`;
 };
+
+const interceptTextResponse = responseInterceptor(async (responseBuffer, proxyRes, req: Request, res) => {
+    const target = getTargetUrl(req);
+    if (!target) return responseBuffer;
+
+    const expressRes = res as Response;
+    removedHeaders.forEach((header) => expressRes.removeHeader(header));
+    expressRes.setHeader('Access-Control-Allow-Origin', '*');
+
+    const contentType = String(proxyRes.headers['content-type'] ?? '').toLowerCase();
+    if (contentType.includes('text/html')) {
+        return Buffer.from(rewriteResponse(responseBuffer.toString('utf8'), target), 'utf8');
+    }
+    return Buffer.from(rewriteCssUrls(responseBuffer.toString('utf8'), target.origin), 'utf8');
+});
 
 export const proxyHandler = createProxyMiddleware({
     router: (req: Request) => getTargetUrl(req)?.origin ?? envConfig.defaultEngine,
@@ -230,40 +313,34 @@ export const proxyHandler = createProxyMiddleware({
             proxyReq.setHeader('Host', target.host);
             proxyReq.setHeader('User-Agent', browserUserAgent);
         },
-        proxyRes: responseInterceptor(async (responseBuffer, proxyRes, req: Request, res) => {
+        proxyRes: (proxyRes, req: Request, res) => {
             const target = getTargetUrl(req);
-            if (!target) return responseBuffer;
-
             const expressRes = res as Response;
-            
-            removedHeaders.forEach((header) => expressRes.removeHeader(header));
-            expressRes.setHeader('Access-Control-Allow-Origin', '*');
-
             const status = proxyRes.statusCode ?? 200;
-            const location = proxyRes.headers.location;
-
-            if (redirectStatuses.has(status) && location) {
-                try {
-                    const locStr = String(location);
-                    if (!locStr.startsWith('/__p/')) {
-                        expressRes.setHeader('location', `${proxiedPath}${new URL(locStr, target.origin).href}`);
-                    }
-                } catch {}
-                return responseBuffer;
-            }
-
             const contentType = String(proxyRes.headers['content-type'] ?? '').toLowerCase();
-            const requestUrl = (req.originalUrl || '').toLowerCase();
-
-            if (contentType.includes('text/html')) {
-                return Buffer.from(rewriteResponse(responseBuffer.toString('utf8'), target), 'utf8');
-            }
-            if (contentType.includes('text/css') || requestUrl.endsWith('.css')) {
-                return Buffer.from(rewriteCssUrls(responseBuffer.toString('utf8'), target.origin), 'utf8');
+            if (target && status === 200 && req.method !== 'HEAD' && !req.headers.range &&
+                (contentType.includes('text/html') || contentType.includes('text/css'))) {
+                void interceptTextResponse(proxyRes, req, res);
+                return;
             }
 
-            return responseBuffer;
-        }),
+            expressRes.statusCode = status;
+            for (const [name, value] of Object.entries(proxyRes.headers)) {
+                if (value === undefined || removedHeaders.includes(name) || name === 'transfer-encoding') continue;
+                if (name === 'set-cookie') {
+                    expressRes.setHeader(name, (Array.isArray(value) ? value : [value]).map((cookie) => cookie.replace(/;\s*domain=[^;]*/ig, '')));
+                } else {
+                    expressRes.setHeader(name, value);
+                }
+            }
+            expressRes.setHeader('Access-Control-Allow-Origin', '*');
+            const location = proxyRes.headers.location;
+            if (target && redirectStatuses.has(status) && location && !location.startsWith(proxiedPath)) {
+                try { expressRes.setHeader('location', `${proxiedPath}${new URL(location, target.href).href}`); } catch {}
+            }
+            proxyRes.on('error', () => expressRes.destroy());
+            proxyRes.pipe(expressRes);
+        },
         error: (_error, _req, res) => {
             const expressRes = res as Response;
             if (!expressRes.headersSent) expressRes.status(502).send(`Gateway Engine: target unreachable. Reason: ${_error.message}`);
