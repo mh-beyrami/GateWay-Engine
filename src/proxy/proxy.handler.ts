@@ -105,6 +105,23 @@ const getInjectedScript = (currentUrl: string): string => `
         return (target.startsWith('http://') || target.startsWith('https://')) && target !== location.href ? target : initialUrl;
     }
 
+    // The blocked player ad can leave its overlay in place when the site's
+    // close handler does not initialize (notably in some iOS WebViews).
+    // Only hide the overlay containing this site's own ad iframe and button.
+    if (/^(?:www\\.)?porniran\\.com$/i.test(new URL(initialUrl).hostname)) {
+        function hidePlayerAd() {
+            document.querySelectorAll('iframe[title="advertisement"]').forEach(function (frame) {
+                const overlay = frame.closest('div.absolute.inset-0');
+                if (!overlay || !Array.from(overlay.querySelectorAll('button')).some(function (button) {
+                    return button.textContent.trim() === 'بستن تبلیغ';
+                })) return;
+                overlay.style.setProperty('display', 'none', 'important');
+            });
+        }
+        hidePlayerAd();
+        new MutationObserver(hidePlayerAd).observe(document, { childList: true, subtree: true });
+    }
+
     function resolveUrl(value) {
         try {
             const resolved = new URL(unwrap(value), currentUrl());
