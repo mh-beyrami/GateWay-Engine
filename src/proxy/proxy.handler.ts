@@ -251,6 +251,25 @@ const getInjectedScript = (currentUrl: string): string => `
         return nativeSetAttribute.call(this, name, nextValue);
     };
 
+    // Markup created with innerHTML bypasses setAttribute and createElement.
+    // Repair image sources added or changed by client-side rendering.
+    function rewriteDynamicImage(image) {
+        const value = image.getAttribute('src');
+        if (!value || isIgnored(value) || value.startsWith('/__p/')) return;
+        const rewritten = proxify(value);
+        if (rewritten && rewritten !== value) nativeSetAttribute.call(image, 'src', rewritten);
+    }
+    new MutationObserver(function (mutations) {
+        for (const mutation of mutations) {
+            if (mutation.type === 'attributes') rewriteDynamicImage(mutation.target);
+            else mutation.addedNodes.forEach(function (node) {
+                if (node.nodeType !== Node.ELEMENT_NODE) return;
+                if (node.matches('img')) rewriteDynamicImage(node);
+                node.querySelectorAll('img[src]').forEach(rewriteDynamicImage);
+            });
+        }
+    }).observe(document, { subtree: true, childList: true, attributes: true, attributeFilter: ['src'] });
+
     const originalCreateElement = document.createElement.bind(document);
     document.createElement = function(tagName, options) {
         const el = originalCreateElement(tagName, options);
@@ -385,7 +404,9 @@ const rewriteResponse = (html: string, target: URL): string => {
         (tag, _quote: string, src: string) => {
             try { return isBlockedAdUrl(new URL(src, target).href) ? '' : tag; } catch { return tag; }
         });
-    const rewritten = rewriteHtmlPaths(withoutAdScripts.replace(/integrity=(['"]).*?\1/gi, ''), target.origin);
+    const rewritten = rewriteHtmlPaths(withoutAdScripts.replace(/integrity=(['"]).*?\1/gi, ''), target.origin)
+        .replace(/(<style\b[^>]*>)([\s\S]*?)(<\/style\s*>)/gi,
+            (_match, open: string, css: string, close: string) => open + rewriteCssUrls(css, target) + close);
     const fontInjection = `
 <style>
 #myAdBanner, ins.adsbygoogle, ins[id="1085018"], [data-ad-slot] { display: none !important; }
