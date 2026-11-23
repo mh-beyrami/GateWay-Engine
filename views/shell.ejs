@@ -6,9 +6,15 @@
     <title>Gateway Engine Core</title>
     <link rel="stylesheet" href="/__static/css/persian-font.css">
     <link rel="stylesheet" href="/__static/css/shell.css">
+    <link rel="stylesheet" href="/__static/css/error.css">
 </head>
 <body>
-    <iframe id="gateway-view" src="/__newtab" title="Gateway content" sandbox="allow-scripts allow-same-origin allow-forms allow-downloads"></iframe>
+    <div id="tab-strip" role="tablist" aria-label="تب‌ها"><div id="tabs"></div><button id="new-tab-button" type="button" aria-label="تب جدید" title="تب جدید (Ctrl+T)">+</button></div>
+    <div id="views">
+        <section id="local-error" class="error-layout" hidden>
+            <%- include('error-card', { issue: null, address: '', retryUrl: '' }) %>
+        </section>
+    </div>
 
     <div id="__engine_bar__" style="display: none;">
         <button type="button" id="back-button" aria-label="بازگشت" title="بازگشت"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M19 12H5m0 0 6-6m-6 6 6 6" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
@@ -17,13 +23,111 @@
             <svg class="address-icon" viewBox="0 0 24 24" fill="none" aria-hidden="true"><circle cx="12" cy="12" r="8" stroke="currentColor" stroke-width="1.5"/><path d="M4 12h16M12 4c2.5 2.4 3.5 5.1 3.5 8S14.5 17.6 12 20c-2.5-2.4-3.5-5.1-3.5-8S9.5 6.4 12 4Z" stroke="currentColor" stroke-width="1.3"/></svg>
             <input type="text" id="engine-input" dir="auto" placeholder="جست‌وجو یا وارد کردن آدرس..." autocomplete="off" aria-label="جست‌وجو یا وارد کردن آدرس">
         </form>
+        <button type="button" id="reload-button" aria-label="بارگذاری مجدد" title="بارگذاری مجدد"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="M20 7v5h-5M20 12a8 8 0 1 0-2.34 5.66" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></button>
         <button type="button" class="home-btn" id="home-button" aria-label="صفحهٔ شروع" title="صفحهٔ شروع"><svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><path d="m4 10 8-6 8 6v9a1 1 0 0 1-1 1h-5v-6h-4v6H5a1 1 0 0 1-1-1v-9Z" stroke="currentColor" stroke-width="1.6" stroke-linejoin="round"/></svg><span>خانه</span></button>
+        <div id="load-feedback" data-state="idle">
+            <span id="load-message" dir="rtl" role="status" aria-atomic="true"></span>
+            <span class="load-track" aria-hidden="true"><span class="load-fill"></span></span>
+        </div>
     </div>
 
+    <dialog id="link-actions" dir="rtl" aria-labelledby="link-actions-title">
+        <h2 id="link-actions-title">گزینه‌های لینک</h2>
+        <p id="link-actions-host" dir="ltr"></p>
+        <form method="dialog">
+            <button type="submit" value="new-tab">باز کردن در تب جدید</button>
+            <button type="submit" value="cancel">انصراف</button>
+        </form>
+    </dialog>
+
     <script>
-        const view = document.getElementById('gateway-view');
         const input = document.getElementById('engine-input');
         const engineBar = document.getElementById('__engine_bar__');
+        const tabsContainer = document.getElementById('tabs');
+        const views = document.getElementById('views');
+        const localError = document.getElementById('local-error');
+        const loadFeedback = document.getElementById('load-feedback');
+        const loadMessage = document.getElementById('load-message');
+        const linkActions = document.getElementById('link-actions');
+        const linkActionsHost = document.getElementById('link-actions-host');
+        const tabs = [];
+        let activeTab;
+        let linkActionTarget;
+
+        const loadMessages = {
+            idle: '',
+            loading: 'در حال بارگذاری…',
+            slow: 'بارگذاری بیش از حد معمول طول کشیده؛ هنوز منتظریم.',
+            done: 'بارگذاری کامل شد.',
+            error: 'بارگذاری با خطا روبه‌رو شد.'
+        };
+        const gatewayUnavailable = {
+            title: 'ارتباط با Gateway برقرار نشد',
+            description: 'درخواست به خود Gateway نرسید یا Gateway پاسخ قابل‌خواندن برنگرداند.',
+            hint: 'اتصال اینترنت یا وضعیت اجرای Gateway را بررسی کن و دوباره تلاش کن.',
+            code: 'GATEWAY_UNAVAILABLE'
+        };
+        const frameUnavailable = {
+            title: 'صفحه در Gateway نمایش داده نشد',
+            description: 'مرورگر نتوانست صفحه را در این تب بارگذاری کند.',
+            hint: 'دوباره تلاش کن. اگر خطا تکرار شد، آدرس را مستقیم در مرورگر باز کن.',
+            code: 'FRAME_LOAD_FAILED'
+        };
+
+        function clearLoad(load) {
+            clearTimeout(load.timer);
+            load.request?.abort();
+        }
+
+        function startLoad(tab, phase, previousDocument = null) {
+            clearLoad(tab.load);
+            tab.issue = null;
+            const load = { status: 'loading', phase, previousDocument, startedAt: performance.now() };
+            load.timer = setTimeout(() => {
+                if (tab.load !== load) return;
+                load.status = 'slow';
+                if (tab === activeTab) renderFeedback();
+            }, 9000);
+            tab.load = load;
+            if (tab === activeTab) renderFeedback();
+            return load;
+        }
+
+        function finishLoad(tab, status, message) {
+            clearLoad(tab.load);
+            const load = { status, message };
+            tab.load = load;
+            if (status === 'done') {
+                load.timer = setTimeout(() => {
+                    if (tab.load === load) finishLoad(tab, 'idle');
+                }, 1500);
+            }
+            if (tab === activeTab) renderFeedback();
+        }
+
+        function showLocalError(tab, issue, target) {
+            tab.issue = { ...issue, address: target, retryTarget: issue.code === 'INVALID_URL' ? '' : target };
+            tab.label.textContent = issue.title;
+            finishLoad(tab, 'error', issue.title);
+        }
+
+        function renderFeedback() {
+            const { load, issue, url } = activeTab;
+            engineBar.style.display = url || load.status !== 'idle' ? 'flex' : 'none';
+            engineBar.classList.toggle('has-load-feedback', load.status !== 'idle');
+            loadFeedback.dataset.state = load.status;
+            loadFeedback.style.setProperty('--load-offset', load.startedAt ? `-${Math.floor(performance.now() - load.startedAt)}ms` : '0ms');
+            const message = load.message || loadMessages[load.status];
+            if (loadMessage.textContent !== message) loadMessage.textContent = message;
+            localError.hidden = !issue;
+            activeTab.view.inert = !!issue;
+            if (!issue) return;
+            for (const key of ['title', 'description', 'code', 'address', 'hint']) {
+                localError.querySelector(`[data-error-${key}]`).textContent = issue[key] || '';
+            }
+            localError.querySelector('[data-error-address-row]').hidden = !issue.address;
+            localError.querySelector('[data-gateway-retry]').hidden = !issue.retryTarget;
+        }
 
         function unwrapTarget(value) {
             let target = String(value);
@@ -41,38 +145,156 @@
             return target;
         }
 
-        function updateEngineBar() {
+        function updateEngineBar(tab) {
+            const load = tab.load;
+            if (tab.issue || load.phase === 'resolve') return;
             try {
-                const href = view.contentWindow.location.href;
-                if (href.includes('/__newtab')) {
-                    input.value = '';
-                    engineBar.style.display = 'none';
-                } else if (href.includes('/__p/')) {
-                    input.value = unwrapTarget(href);
-                    engineBar.style.display = 'flex';
+                const page = new URL(tab.view.contentWindow.location.href);
+                const doc = tab.view.contentDocument;
+                if (page.protocol === 'about:' || doc === load.previousDocument) return;
+                if (page.pathname === '/__newtab') {
+                    if (load.phase === 'page') return;
+                    tab.url = '';
+                    tab.label.textContent = 'تب جدید';
+                    tab.issue = null;
+                    finishLoad(tab, 'idle');
+                } else if (page.pathname.startsWith('/__p/')) {
+                    tab.url = unwrapTarget(page.href);
+                    tab.label.textContent = doc.title || tab.url;
+                    tab.issue = null;
+                    const errorCode = doc.querySelector('meta[name="gateway-error"]')?.content;
+                    const upstreamStatus = tab.view.contentWindow.performance.getEntriesByType('navigation')[0]?.responseStatus;
+                    if (errorCode) {
+                        doc.querySelector('[data-gateway-retry]')?.addEventListener('click', (event) => {
+                            event.preventDefault();
+                            navigateTo(tab.url, tab);
+                        });
+                        finishLoad(tab, 'error', `بارگذاری ناموفق بود · ${errorCode}`);
+                    } else if (upstreamStatus >= 400) {
+                        finishLoad(tab, 'error', `سایت مقصد خطا برگرداند · HTTP ${upstreamStatus}`);
+                    } else {
+                        finishLoad(tab, 'done');
+                    }
+                } else if (load.phase) {
+                    finishLoad(tab, 'done');
                 }
-            } catch {}
+                if (tab === activeTab) syncBar();
+            } catch {
+                if (load.phase === 'page') showLocalError(tab, frameUnavailable, tab.url);
+            }
         }
 
-        view.addEventListener('load', updateEngineBar);
+        function syncBar() {
+            input.value = activeTab.url;
+            renderFeedback();
+        }
 
-        async function navigateTo(target) {
-            if (typeof target === 'string') target = unwrapTarget(target);
+        function activateTab(tab) {
+            if (tab !== activeTab && linkActions.open) linkActions.close('cancel');
+            activeTab = tab;
+            tabs.forEach((item) => {
+                const active = item === tab;
+                item.view.hidden = !active;
+                item.button.setAttribute('aria-selected', String(active));
+                item.button.tabIndex = active ? 0 : -1;
+            });
+            syncBar();
+        }
+
+        function createTab(target, activate = true) {
+            const view = document.createElement('iframe');
+            view.className = 'gateway-view';
+            view.title = 'Gateway content';
+            view.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-forms allow-downloads');
+            view.src = '/__newtab';
+            const button = document.createElement('div');
+            button.className = 'tab';
+            button.setAttribute('role', 'tab');
+            const label = document.createElement('span');
+            label.className = 'tab-label';
+            label.textContent = 'تب جدید';
+            const close = document.createElement('button');
+            close.type = 'button';
+            close.className = 'close-tab';
+            close.setAttribute('aria-label', 'بستن تب');
+            close.textContent = '×';
+            button.append(label, close);
+            const tab = { view, button, label, url: '', issue: null, load: { status: 'idle' } };
+            tabs.push(tab);
+            tabsContainer.append(button);
+            views.append(view);
+            button.addEventListener('click', () => activateTab(tab));
+            button.addEventListener('keydown', (event) => { if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); activateTab(tab); } });
+            close.addEventListener('click', (event) => { event.stopPropagation(); closeTab(tab); });
+            view.addEventListener('load', () => updateEngineBar(tab));
+            if (activate || !activeTab) activateTab(tab); else view.hidden = true;
+            if (target) navigateTo(target, tab);
+            return tab;
+        }
+
+        function closeTab(tab) {
+            const index = tabs.indexOf(tab);
+            if (index < 0) return;
+            clearLoad(tab.load);
+            tabs.splice(index, 1);
+            tab.view.remove();
+            tab.button.remove();
+            if (!tabs.length) createTab();
+            else if (tab === activeTab) activateTab(tabs[Math.min(index, tabs.length - 1)]);
+        }
+
+        async function navigateTo(target, tab = activeTab) {
+            if (typeof target !== 'string') return;
+            target = unwrapTarget(target).trim();
+            if (!target) return;
+            if (target === 'MAIN') {
+                startLoad(tab, 'home', tab.view.contentDocument);
+                tab.view.src = '/__newtab';
+                return;
+            }
+            tab.url = target;
+            const load = startLoad(tab, 'resolve');
+            const request = new AbortController();
+            load.request = request;
+            const deadline = setTimeout(() => request.abort(), 20000);
+            if (tab === activeTab) syncBar();
             try {
                 const res = await fetch('/__engine/set-target', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ target })
+                    body: JSON.stringify({ target }),
+                    signal: request.signal
                 });
                 const data = await res.json();
-                if (data.success) {
-                    if (data.displayUrl) {
-                        input.value = unwrapTarget(data.displayUrl);
-                        engineBar.style.display = 'flex';
-                    }
-                    view.src = data.url;
+                if (tab.load !== load || !tabs.includes(tab)) return;
+                if (!res.ok || !data.success) {
+                    showLocalError(tab, data.error || gatewayUnavailable, target);
+                    return;
                 }
-            } catch {}
+                if (typeof data.url !== 'string' || !data.url.startsWith('/__p/')) throw new Error('Missing proxy URL');
+                tab.url = unwrapTarget(data.displayUrl || target);
+                // A fragment change in the current document does not fire an iframe load event.
+                const next = new URL(data.url, location.origin);
+                const current = tab.view.contentDocument?.URL;
+                if (current && current.split('#')[0] === next.href.split('#')[0] &&
+                    (current !== next.href || next.hash) &&
+                    !tab.view.contentDocument.querySelector('meta[name="gateway-error"]')) {
+                    tab.view.src = data.url;
+                    finishLoad(tab, 'done');
+                    if (tab === activeTab) syncBar();
+                    return;
+                }
+                tab.label.textContent = tab.url;
+                load.phase = 'page';
+                load.previousDocument = tab.view.contentDocument;
+                if (tab === activeTab) syncBar();
+                tab.view.src = data.url;
+            } catch {
+                if (tab.load === load && tabs.includes(tab)) showLocalError(tab, gatewayUnavailable, target);
+            } finally {
+                clearTimeout(deadline);
+                if (tab.load === load) load.request = null;
+            }
         }
 
         document.getElementById('engine-form').addEventListener('submit', (e) => {
@@ -81,24 +303,95 @@
         });
 
         document.getElementById('back-button').addEventListener('click', () => {
-            try { view.contentWindow.history.back(); } catch {}
+            const tab = activeTab;
+            if (tab.issue || tab.load.phase === 'resolve') {
+                tab.issue = null;
+                finishLoad(tab, 'idle');
+                updateEngineBar(tab);
+                return;
+            }
+            if (tab.load.phase === 'page') finishLoad(tab, 'idle');
+            try { tab.view.contentWindow.history.back(); } catch {}
         });
 
         document.getElementById('forward-button').addEventListener('click', () => {
-            try { view.contentWindow.history.forward(); } catch {}
+            const tab = activeTab;
+            if (tab.load.phase === 'page') finishLoad(tab, 'idle');
+            try { tab.view.contentWindow.history.forward(); } catch {}
+        });
+
+        document.getElementById('reload-button').addEventListener('click', () => {
+            const tab = activeTab;
+            if (tab.issue || tab.load.status === 'error' || (tab.url && tab.load.phase)) {
+                navigateTo(tab.url, tab);
+                return;
+            }
+            try {
+                startLoad(tab, tab.url ? 'page' : 'home', tab.view.contentDocument);
+                tab.view.contentWindow.location.reload();
+            } catch {
+                showLocalError(tab, frameUnavailable, tab.url);
+            }
         });
 
         document.getElementById('home-button').addEventListener('click', () => navigateTo('MAIN'));
 
+        document.getElementById('new-tab-button').addEventListener('click', () => createTab());
+        localError.querySelector('[data-gateway-retry]').addEventListener('click', (event) => {
+            event.preventDefault();
+            if (activeTab.issue?.retryTarget) navigateTo(activeTab.issue.retryTarget);
+        });
+
+        linkActions.addEventListener('close', () => {
+            const action = linkActionTarget;
+            linkActionTarget = null;
+            if (linkActions.returnValue !== 'new-tab' || action?.tab !== activeTab) return;
+            const tab = createTab(action.url, false);
+            tab.button.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+        });
+
+        function handleShortcut(e) {
+            if (!(e.ctrlKey || e.metaKey)) return;
+            if (e.key.toLowerCase() === 't') { e.preventDefault(); createTab(); }
+            else if (e.key.toLowerCase() === 'w') { e.preventDefault(); closeTab(activeTab); }
+            else if (e.key === 'Tab') { e.preventDefault(); const i = tabs.indexOf(activeTab); activateTab(tabs[(i + (e.shiftKey ? -1 : 1) + tabs.length) % tabs.length]); }
+        }
+        window.addEventListener('keydown', handleShortcut);
+
         window.addEventListener('message', (e) => {
-            if (e.source !== view.contentWindow || !e.data) return;
-            if (e.data.type === 'ENGINE_URL') {
-                input.value = unwrapTarget(e.data.target);
-                engineBar.style.display = 'flex';
+            const tab = tabs.find((item) => item.view.contentWindow === e.source);
+            if (!tab || !e.data) return;
+            if (e.data.type === 'ENGINE_PAGE_START' && e.origin === location.origin) {
+                if (tab.issue || tab.load.phase) return;
+                try {
+                    if (tab.view.contentWindow.location.href === e.data.url && tab.view.contentDocument.readyState !== 'complete') {
+                        startLoad(tab, 'page');
+                    }
+                } catch {}
+            } else if (e.data.type === 'ENGINE_URL') {
+                if (tab.issue || tab.load.phase) return;
+                tab.url = unwrapTarget(e.data.target);
+                tab.label.textContent = tab.url;
+                if (tab === activeTab) syncBar();
             } else if (e.data.type === 'ENGINE_NAV') {
-                navigateTo(e.data.target);
+                navigateTo(e.data.target, tab);
+            } else if (e.data.type === 'ENGINE_NEW_TAB') {
+                createTab(e.data.target, !!e.data.activate);
+            } else if (e.data.type === 'ENGINE_LINK_ACTIONS' && tab === activeTab && e.origin === location.origin) {
+                if (linkActions.open || linkActionTarget || typeof e.data.target !== 'string') return;
+                try {
+                    const url = new URL(e.data.target);
+                    if (url.protocol !== 'http:' && url.protocol !== 'https:') return;
+                    linkActionsHost.textContent = url.host;
+                    linkActions.returnValue = '';
+                    linkActions.showModal();
+                    linkActionTarget = { tab, url: url.href };
+                } catch {}
+            } else if (e.data.type === 'ENGINE_SHORTCUT' && tab === activeTab) {
+                handleShortcut({ ...e.data, preventDefault() {} });
             }
         });
+        createTab();
     </script>
 </body>
 </html>

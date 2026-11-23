@@ -1,12 +1,15 @@
-import { Request, Response } from 'express';
+import { Request, RequestHandler, Response } from 'express';
 import { createProxyMiddleware, responseInterceptor } from 'http-proxy-middleware';
 import { envConfig } from '../config/env.config.js';
 import { isBlockedAdUrl } from '../utils/ad-blocker.js';
+import { connectionIssue, invalidAddress, isDocumentRequest, renderGatewayError, upstreamIssue } from '../utils/gateway-error.js';
 
 const proxiedPath = '/__p/';
 const systemPrefixes = ['/__p/', '/__engine/', '/__static/'];
 const browserUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 const redirectStatuses = new Set([301, 302, 303, 307, 308]);
+const interactiveErrorStatuses = new Set([401, 403, 429]);
+const documentResponseTimeout = 25_000;
 
 const removedHeaders = [
     'content-security-policy',
@@ -58,13 +61,26 @@ const getTargetUrl = (req: Request): URL | null => {
     }
 };
 
+export const validateProxyNavigation: RequestHandler = (req, res, next) => {
+    if (isDocumentRequest(req) && !getTargetUrl(req)) {
+        renderGatewayError(res, 400, invalidAddress);
+        return;
+    }
+    next();
+};
+
 const getInjectedScript = (currentUrl: string): string => `
 <script>
 (function () {
     const initialUrl = ${JSON.stringify(currentUrl)};
     const systemPrefixes = ${JSON.stringify(systemPrefixes)};
+    if (window.parent !== window) {
+        window.parent.postMessage({ type: 'ENGINE_PAGE_START', url: location.href }, location.origin);
+    }
 
-    // Keep sites from opening advertising windows outside the embedded view.
+    // Script-created windows are frequently pop-under ads, including when a
+    // site launches them during a genuine click. Explicit link gestures are
+    // handled separately below and remain available.
     window.open = function () { return null; };
 
     function unwrap(value) {
@@ -119,16 +135,123 @@ const getInjectedScript = (currentUrl: string): string => `
         if (resolved) window.parent.postMessage({ type: 'ENGINE_NAV', target: resolved }, '*');
     }
 
+    window.addEventListener('keydown', function (event) {
+        if ((event.ctrlKey || event.metaKey) && ['t', 'w', 'Tab'].includes(event.key)) {
+            event.preventDefault();
+            window.parent.postMessage({ type: 'ENGINE_SHORTCUT', key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }, '*');
+        }
+    });
+
+    let linkPress;
+    let heldLink;
+
+    function cancelLinkPress() {
+        if (linkPress) clearTimeout(linkPress.timer);
+        linkPress = null;
+    }
+
+    function showLinkActions() {
+        if (!linkPress) return;
+        const { link, pointerId } = linkPress;
+        cancelLinkPress();
+        const href = link.getAttribute('href')?.trim();
+        if (!link.isConnected || !href || /^(data:|blob:|javascript:)/i.test(href)) return;
+        const target = resolveUrl(href);
+        if (!target || !(target.startsWith('https://') || target.startsWith('http://'))) return;
+        heldLink = { link, pointerId };
+        window.parent.postMessage({ type: 'ENGINE_LINK_ACTIONS', target }, location.origin);
+    }
+
+    document.addEventListener('pointerdown', function (event) {
+        cancelLinkPress();
+        heldLink = null;
+        if (event.pointerType !== 'touch' || !event.isPrimary) return;
+        const link = event.target.closest?.('a[href]:not([download])');
+        if (!link) return;
+        linkPress = { link, pointerId: event.pointerId, x: event.clientX, y: event.clientY, timer: setTimeout(showLinkActions, 500) };
+    }, true);
+
+    document.addEventListener('pointermove', function (event) {
+        if (linkPress?.pointerId === event.pointerId &&
+            Math.hypot(event.clientX - linkPress.x, event.clientY - linkPress.y) > 10) cancelLinkPress();
+    }, true);
+
+    for (const type of ['pointerup', 'pointercancel']) {
+        document.addEventListener(type, function (event) {
+            if (linkPress?.pointerId === event.pointerId) cancelLinkPress();
+        }, true);
+    }
+
+    document.addEventListener('contextmenu', function (event) {
+        const link = event.target.closest?.('a[href]');
+        if (!link || (linkPress?.link !== link && heldLink?.link !== link)) return;
+        if (event.pointerType && event.pointerType !== 'touch') return;
+        showLinkActions();
+        if (heldLink?.link === link) event.preventDefault();
+    }, true);
+
+    // Some browsers still send a click on release after a long press.
     document.addEventListener('click', function (event) {
-        if (event.defaultPrevented || event.button !== 0 || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+        if (!heldLink || !event.detail || event.target.closest?.('a') !== heldLink.link) return;
+        if (event.pointerType && (event.pointerType !== 'touch' || event.pointerId !== heldLink.pointerId)) return;
+        heldLink = null;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+    }, true);
+
+    // Do not let a script manufacture a new-tab link click to evade the
+    // popup blocker. User clicks and keyboard activation are trusted events.
+    document.addEventListener('click', function (event) {
+        if (event.isTrusted) return;
+        const link = event.target.closest?.('a[href]');
+        if (link && (link.target.toLowerCase() === '_blank' || event.ctrlKey || event.metaKey || event.shiftKey)) {
+            event.preventDefault();
+            event.stopImmediatePropagation();
+        }
+    }, true);
+
+    document.addEventListener('click', function (event) {
+        if (event.defaultPrevented || event.button !== 0 || event.altKey) return;
         const link = event.target.closest('a');
         if (!link || !link.hasAttribute('href') || link.hasAttribute('download')) return;
         const href = link.getAttribute('href');
         if (isIgnored(href)) return;
         
         event.preventDefault();
-        navigate(href);
+        if (event.ctrlKey || event.metaKey || event.shiftKey || link.target === '_blank') {
+            const target = resolveUrl(href);
+            if (target) window.parent.postMessage({ type: 'ENGINE_NEW_TAB', target, activate: event.shiftKey || (!event.ctrlKey && !event.metaKey) }, '*');
+        } else {
+            navigate(href);
+        }
     });
+
+    document.addEventListener('auxclick', function (event) {
+        if (event.defaultPrevented || event.button !== 1) return;
+        const link = event.target.closest('a[href]');
+        if (!link || link.hasAttribute('download') || isIgnored(link.getAttribute('href'))) return;
+        const target = resolveUrl(link.getAttribute('href'));
+        if (target) { event.preventDefault(); window.parent.postMessage({ type: 'ENGINE_NEW_TAB', target, activate: event.shiftKey }, '*'); }
+    });
+
+    // This site's search form has no action; its React handler normally builds
+    // /search?q=... itself. Route it before React so it also works when the
+    // client-side router cannot operate under the proxy URL.
+    document.addEventListener('submit', function (event) {
+        const form = event.target.closest?.('form[role="search"]');
+        const hostname = new URL(currentUrl()).hostname.toLowerCase();
+        if (!form || (hostname !== 'porniran.com' && hostname !== 'www.porniran.com') ||
+            form.hasAttribute('action') || (form.method || 'get').toLowerCase() !== 'get') return;
+        const query = new FormData(form).get('q');
+        if (typeof query !== 'string') return;
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        const value = query.trim();
+        if (!value) return;
+        const target = new URL('/search', currentUrl());
+        target.searchParams.set('q', value);
+        navigate(target.href);
+    }, true);
 
     document.addEventListener('submit', function (event) {
         const form = event.target.closest('form');
@@ -140,7 +263,8 @@ const getInjectedScript = (currentUrl: string): string => `
             const action = new URL(unwrap(form.getAttribute('action') || ''), currentUrl());
             const params = new URLSearchParams(new FormData(form));
             params.forEach((value, key) => action.searchParams.set(key, value));
-            navigate(action.href);
+            if (form.target === '_blank') window.parent.postMessage({ type: 'ENGINE_NEW_TAB', target: action.href, activate: true }, '*');
+            else navigate(action.href);
         } catch {}
     });
 
@@ -219,10 +343,26 @@ const getInjectedScript = (currentUrl: string): string => `
 })();
 </script>`;
 
-const rewriteCssUrls = (css: string, targetOrigin: string): string => css.replace(
-    /url\(\s*(['"]?)(\/(?!\/|__p\/|__engine\/|__static\/)[^'")]*)\1\s*\)/gi,
-    (_, quote: string, path: string) => `url(${quote}${proxiedPath}${targetOrigin}${path}${quote})`
-);
+const proxifyResource = (value: string, base: URL): string => {
+    if (!value || /^(?:data:|blob:|javascript:|#)/i.test(value) ||
+        systemPrefixes.some((prefix) => value.startsWith(prefix))) return value;
+    try {
+        const resolved = new URL(value, base);
+        return resolved.protocol === 'http:' || resolved.protocol === 'https:'
+            ? `${proxiedPath}${resolved.href}`
+            : value;
+    } catch { return value; }
+};
+
+const rewriteCssUrls = (css: string, target: URL): string => css
+    .replace(/url\(\s*(['"]?)([^'"\)]*)\1\s*\)/gi,
+        (match, quote: string, value: string) => {
+            const path = value.trim();
+            return path ? `url(${quote}${proxifyResource(path, target)}${quote})` : match;
+        })
+    .replace(/(@import\s+)(['"])([^'"]+)\2/gi,
+        (_match, prefix: string, quote: string, value: string) =>
+            `${prefix}${quote}${proxifyResource(value, target)}${quote}`);
 
 const rewriteHtmlPaths = (html: string, targetOrigin: string): string => {
     let result = html
@@ -231,15 +371,32 @@ const rewriteHtmlPaths = (html: string, targetOrigin: string): string => {
         .replace(/\bping\s*=\s*(["']).*?\1/gi, '');
         
     result = result.replace(
-        /(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\/(?!\/|__p\/|__engine\/|__static\/)([^"']*)\2/gi,
+        /(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\s*\/(?!\/|__p\/|__engine\/|__static\/)([^"']*?)\s*\2/gi,
         `$1$2${proxiedPath}${targetOrigin}/$3$2`
     );
     
     result = result.replace(
-        /(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\/\/([^"']+)\2/gi,
+        /(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\s*\/\/([^"']+?)\s*\2/gi,
         `$1$2${proxiedPath}https://$3$2`
     );
+
+    // Server-rendered absolute asset URLs bypass the dynamic DOM hooks.
+    // Route them through the gateway just like root-relative URLs.
+    result = result.replace(
+        /(\s(?:src|href|action|poster|data-src)\s*=\s*)(["'])\s*(https?:\/\/[^"']*?)\s*\2/gi,
+        (_match, prefix: string, quote: string, value: string) =>
+            `${prefix}${quote}${proxiedPath}${value}${quote}`
+    );
     
+    // React Server Components include a second list of chunk URLs inside
+    // inline Flight data. Keep those URLs identical to the proxied script
+    // elements, otherwise Turbopack waits forever for the original URL.
+    result = result.replace(/<script\b[^>]*>[\s\S]*?<\/script\s*>/gi, (script) => {
+        if (!script.includes('self.__next_f.push')) return script;
+        return script.replace(/(["'])\/_next\/static\/chunks\//g,
+            `$1${proxiedPath}${targetOrigin}/_next/static/chunks/`);
+    });
+
     result = result.replace(
         /([;,\s]url\s*=\s*["']?)\/(?!\/|__p\/|__engine\/|__static\/)/gi,
         `$1${proxiedPath}${targetOrigin}/`
@@ -257,6 +414,11 @@ const rewriteResponse = (html: string, target: URL): string => {
     const fontInjection = `
 <style>
 #myAdBanner, ins.adsbygoogle, ins[id="1085018"], [data-ad-slot] { display: none !important; }
+@media (any-pointer: coarse) {
+    a[href]:not([download], [href=""], [href^="mailto:" i], [href^="tel:" i], [href^="data:" i], [href^="blob:" i], [href^="javascript:" i]) {
+        -webkit-touch-callout: none;
+    }
+}
 @font-face {
     font-family: 'Gateway Vazirmatn';
     src: url('/__static/fonts/vazirmatn-arabic-wght-normal.woff2') format('woff2');
@@ -274,6 +436,15 @@ const rewriteResponse = (html: string, target: URL): string => {
     return `${injection}\n${rewritten}`;
 };
 
+const isTurbopackRuntime = (target: URL): boolean =>
+    /^\/_next\/static\/chunks\/turbopack-[\w.-]+\.js$/.test(target.pathname);
+
+const rewriteTurbopackRuntime = (script: string, target: URL): string => {
+    if (!script.includes('TURBOPACK') || !script.includes('registerChunk')) return script;
+    const assetBase = JSON.stringify(proxiedPath + target.origin + '/_next/');
+    return script.replace(/(["'])\/_next\/\1(?=\s*,\s*[\w$]+\s*=)/, () => assetBase);
+};
+
 const interceptTextResponse = responseInterceptor(async (responseBuffer, proxyRes, req: Request, res) => {
     const target = getTargetUrl(req);
     if (!target) return responseBuffer;
@@ -281,13 +452,27 @@ const interceptTextResponse = responseInterceptor(async (responseBuffer, proxyRe
     const expressRes = res as Response;
     removedHeaders.forEach((header) => expressRes.removeHeader(header));
     expressRes.setHeader('Access-Control-Allow-Origin', '*');
+    // responseInterceptor's own domain rewriting can corrupt cookie attributes.
+    // Use the original upstream values for intercepted HTML, CSS and scripts.
+    if (proxyRes.headers['set-cookie']) {
+        expressRes.setHeader('set-cookie', rewriteCookies(proxyRes.headers['set-cookie']));
+    }
 
     const contentType = String(proxyRes.headers['content-type'] ?? '').toLowerCase();
     if (contentType.includes('text/html')) {
+        // The real page URL is encoded in the gateway path. An upstream
+        // origin-only policy strips it before same-gateway resource requests.
+        expressRes.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
         return Buffer.from(rewriteResponse(responseBuffer.toString('utf8'), target), 'utf8');
     }
-    return Buffer.from(rewriteCssUrls(responseBuffer.toString('utf8'), target.origin), 'utf8');
+    if (isTurbopackRuntime(target) && /javascript|ecmascript/.test(contentType)) {
+        return Buffer.from(rewriteTurbopackRuntime(responseBuffer.toString('utf8'), target), 'utf8');
+    }
+    return Buffer.from(rewriteCssUrls(responseBuffer.toString('utf8'), target), 'utf8');
 });
+
+const rewriteCookies = (value: string | string[]): string[] =>
+    (Array.isArray(value) ? value : [value]).map((cookie) => cookie.replace(/;\s*domain=[^;]*/ig, ''));
 
 export const proxyHandler = createProxyMiddleware({
     router: (req: Request) => getTargetUrl(req)?.origin ?? envConfig.defaultEngine,
@@ -303,13 +488,34 @@ export const proxyHandler = createProxyMiddleware({
         proxyReq: (proxyReq, req: Request) => {
             const target = getTargetUrl(req);
             if (!target) return;
+
+            if (isDocumentRequest(req)) {
+                // Bound the wait for headers, including connection and DNS time.
+                const deadline = setTimeout(() => {
+                    proxyReq.destroy(Object.assign(new Error('Upstream response timed out'), { code: 'ETIMEDOUT' }));
+                }, documentResponseTimeout);
+                proxyReq.once('response', () => clearTimeout(deadline));
+                proxyReq.once('close', () => clearTimeout(deadline));
+            }
             
             // خنثی کردن سیستم تشخیص ربات داک‌داک‌گو
             proxyReq.removeHeader('accept-encoding');
             vercelProxyHeaders.forEach(h => proxyReq.removeHeader(h));
             
-            proxyReq.setHeader('Referer', `${target.origin}/`);
-            proxyReq.setHeader('Origin', target.origin);
+            // Recover the original referring page for cross-domain assets.
+            // Media servers often require the website's origin, not their own.
+            let upstreamReferer = `${target.origin}/`;
+            try {
+                const referer = new URL(req.headers.referer ?? '');
+                if (referer.host === req.headers.host && referer.pathname.startsWith(proxiedPath)) {
+                    const original = new URL(referer.pathname.slice(proxiedPath.length) + referer.search);
+                    if (original.protocol === 'http:' || original.protocol === 'https:') {
+                        upstreamReferer = original.href;
+                    }
+                }
+            } catch {}
+            proxyReq.setHeader('Referer', upstreamReferer);
+            proxyReq.setHeader('Origin', new URL(upstreamReferer).origin);
             proxyReq.setHeader('Host', target.host);
             proxyReq.setHeader('User-Agent', browserUserAgent);
         },
@@ -318,8 +524,23 @@ export const proxyHandler = createProxyMiddleware({
             const expressRes = res as Response;
             const status = proxyRes.statusCode ?? 200;
             const contentType = String(proxyRes.headers['content-type'] ?? '').toLowerCase();
+            // Keep upstream sign-in and verification pages usable.
+            const interactiveError = proxyRes.headers['www-authenticate'] || proxyRes.headers['cf-mitigated'] === 'challenge' ||
+                (contentType.includes('text/html') && interactiveErrorStatuses.has(status));
+            if (target && status >= 400 && status < 600 && !interactiveError && !req.headers.range &&
+                req.method !== 'HEAD' && isDocumentRequest(req)) {
+                proxyRes.on('error', () => {});
+                proxyRes.resume();
+                const cookies = proxyRes.headers['set-cookie'];
+                const retryAfter = proxyRes.headers['retry-after'];
+                if (cookies) expressRes.setHeader('set-cookie', rewriteCookies(cookies));
+                if (retryAfter) expressRes.setHeader('retry-after', retryAfter);
+                renderGatewayError(expressRes, status, upstreamIssue(status), target);
+                return;
+            }
             if (target && status === 200 && req.method !== 'HEAD' && !req.headers.range &&
-                (contentType.includes('text/html') || contentType.includes('text/css'))) {
+                (contentType.includes('text/html') || contentType.includes('text/css') ||
+                    (isTurbopackRuntime(target) && /javascript|ecmascript/.test(contentType)))) {
                 void interceptTextResponse(proxyRes, req, res);
                 return;
             }
@@ -328,7 +549,7 @@ export const proxyHandler = createProxyMiddleware({
             for (const [name, value] of Object.entries(proxyRes.headers)) {
                 if (value === undefined || removedHeaders.includes(name) || name === 'transfer-encoding') continue;
                 if (name === 'set-cookie') {
-                    expressRes.setHeader(name, (Array.isArray(value) ? value : [value]).map((cookie) => cookie.replace(/;\s*domain=[^;]*/ig, '')));
+                    expressRes.setHeader(name, rewriteCookies(value));
                 } else {
                     expressRes.setHeader(name, value);
                 }
@@ -341,9 +562,19 @@ export const proxyHandler = createProxyMiddleware({
             proxyRes.on('error', () => expressRes.destroy());
             proxyRes.pipe(expressRes);
         },
-        error: (_error, _req, res) => {
+        error: (error, req, res) => {
+            if (!('status' in res)) {
+                res.destroy();
+                return;
+            }
             const expressRes = res as Response;
-            if (!expressRes.headersSent) expressRes.status(502).send(`Gateway Engine: target unreachable. Reason: ${_error.message}`);
+            if (expressRes.headersSent || expressRes.destroyed) return;
+            const { status, issue } = connectionIssue((error as NodeJS.ErrnoException).code);
+            if (isDocumentRequest(req as Request)) {
+                renderGatewayError(expressRes, status, issue, getTargetUrl(req as Request) ?? undefined);
+            } else {
+                expressRes.status(status).type('text').send(`Gateway: ${issue.code}`);
+            }
         }
     }
 });

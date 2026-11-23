@@ -1,0 +1,16 @@
+<!DOCTYPE html>
+<html lang="fa" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="gateway-error" content="<%= issue.code %>">
+    <title><%= issue.title %> | Gateway</title>
+    <link rel="stylesheet" href="/__static/css/persian-font.css">
+    <link rel="stylesheet" href="/__static/css/error.css">
+</head>
+<body class="error-page">
+    <main class="error-layout">
+        <%- include('error-card', { issue, address, retryUrl }) %>
+    </main>
+</body>
+</html>

@@ -1,0 +1,16 @@
+.error-page { margin: 0; min-height: 100dvh; background: #101515; }
+.error-page .error-layout { min-height: 100dvh; }
+.error-layout { box-sizing: border-box; display: grid; place-items: center; padding: clamp(14px, 4vw, 32px); color: #e7eee7; font: 14px/1.8 'Gateway Vazirmatn', system-ui, sans-serif; }
+.error-card { box-sizing: border-box; width: min(100%, 520px); padding: clamp(18px, 5vw, 32px); border: 1px solid #ffffff18; border-radius: 20px; background: #151d1b; }
+.error-mark { display: grid; place-items: center; width: 46px; height: 46px; margin-bottom: 16px; border-radius: 13px; background: #c9ed9c12; color: #c9ed9c; }
+.error-mark svg { width: 28px; height: 28px; }
+.error-card h1 { margin: 2px 0 8px; font-size: clamp(20px, 5vw, 26px); line-height: 1.5; }
+.error-card p { margin: 0; color: #b8c7bb; }
+.error-card .error-kicker { color: #c9ed9c; font-size: 12px; }
+.error-card dl { display: grid; gap: 8px; margin: 16px 0; padding: 12px; border-radius: 10px; background: #101515; font-size: 13px; }
+.error-card dt { color: #a5b6a9; font-size: 11px; }
+.error-card dd { margin: 0; text-align: start; overflow-wrap: anywhere; }
+.error-card .error-retry { display: inline-flex; align-items: center; min-height: 42px; margin-top: 16px; padding: 0 16px; border: 1px solid #c9ed9c35; border-radius: 10px; background: #c9ed9c14; color: #d0edae; text-decoration: none; }
+.error-card .error-retry[hidden] { display: none; }
+.error-card .error-retry:hover { background: #c9ed9c28; }
+.error-card .error-retry:focus-visible { outline: 2px solid #c9ed9c; outline-offset: 2px; }

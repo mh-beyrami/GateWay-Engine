@@ -39,6 +39,12 @@
         <footer class="footer"><span dir="ltr">GATEWAY ENGINE <i> / </i> WEB EXPLORER</span><span>یه جای تازه برای شروع <span class="footer-star">✳</span></span></footer>
     </div>
     <script>
+        window.addEventListener('keydown', (event) => {
+            if ((event.ctrlKey || event.metaKey) && ['t', 'w', 'Tab'].includes(event.key)) {
+                event.preventDefault();
+                parent.postMessage({ type: 'ENGINE_SHORTCUT', key: event.key, ctrlKey: event.ctrlKey, metaKey: event.metaKey, shiftKey: event.shiftKey }, '*');
+            }
+        });
         document.getElementById('search-form').addEventListener('submit', (event) => {
             event.preventDefault();
             const input = document.getElementById('search-input');

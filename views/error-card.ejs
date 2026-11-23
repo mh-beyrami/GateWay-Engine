@@ -1,0 +1,14 @@
+<article class="error-card" dir="rtl">
+    <div class="error-mark" aria-hidden="true">
+        <svg viewBox="0 0 32 32" fill="none"><path d="m16 4 12 7v10l-12 7-12-7V11l12-7Z" stroke="currentColor" stroke-width="1.7"/><path d="M16 10.5v6.5m0 4h.01" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </div>
+    <p class="error-kicker">خطا در باز کردن صفحه</p>
+    <h1 data-error-title><%= issue?.title ?? '' %></h1>
+    <p data-error-description><%= issue?.description ?? '' %></p>
+    <dl>
+        <div><dt>کد خطا</dt><dd dir="ltr" data-error-code><%= issue?.code ?? '' %></dd></div>
+        <div data-error-address-row <%= address ? '' : 'hidden' %>><dt>آدرس</dt><dd dir="auto" data-error-address><%= address %></dd></div>
+    </dl>
+    <p class="error-hint" data-error-hint><%= issue?.hint ?? '' %></p>
+    <a class="error-retry" data-gateway-retry href="<%= retryUrl || '#' %>" <%= retryUrl ? '' : 'hidden' %>>تلاش دوباره</a>
+</article>
