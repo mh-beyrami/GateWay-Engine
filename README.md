@@ -8,8 +8,8 @@ The proxy uses a path-prefixed architecture (`/__p/URL`). Each request carries i
 ## Features
 - **Stateless Proxying**: No server-side target caching or global variables.
 - **Header Manipulation**: Removes headers that prevent embedding and sets a browser-like User-Agent.
-- **Relative Path Resolution**: Injects `<base>` tags to fix broken assets (CSS, JS, Images) on destination sites.
-- **Domain Blacklisting**: Custom User-Agent routing logic based on the target domain.
+- **Resource Rewriting**: Routes page resources and navigation through the gateway.
+- **Ad Blocking**: Blocks requests to a small list of advertising hosts.
 
 ## Tech Stack
 - [Node.js](https://nodejs.org/) & [Express](https://expressjs.com/)
@@ -20,7 +20,7 @@ The proxy uses a path-prefixed architecture (`/__p/URL`). Each request carries i
 
 1. Clone the repository:
    ```bash
-   git clone [https://github.com/yourusername/gateway-engine.git](https://github.com/yourusername/gateway-engine.git)
+   git clone <repository-url>
    cd gateway-engine
    ```
 

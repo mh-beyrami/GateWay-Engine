@@ -41,12 +41,6 @@ const getTargetUrl = (req: Request): URL | null => {
     const encodedTarget = (req.originalUrl || req.url || '').replace(/^\/__p\//, '');
     try {
         const target = new URL(encodedTarget);
-        // The legacy links host returns an empty script for paginated results.
-        // Request the same endpoint on DuckDuckGo's primary HTTPS host instead.
-        if (target.hostname === 'links.duckduckgo.com' && target.pathname === '/d.js') {
-            target.protocol = 'https:';
-            target.hostname = 'duckduckgo.com';
-        }
         if (target.protocol === 'http:' || target.protocol === 'https:') return target;
     } catch {}
     
@@ -103,23 +97,6 @@ const getInjectedScript = (currentUrl: string): string => `
     function currentUrl() {
         const target = unwrap(location.href);
         return (target.startsWith('http://') || target.startsWith('https://')) && target !== location.href ? target : initialUrl;
-    }
-
-    // The blocked player ad can leave its overlay in place when the site's
-    // close handler does not initialize (notably in some iOS WebViews).
-    // Only hide the overlay containing this site's own ad iframe and button.
-    if (/^(?:www\\.)?porniran\\.com$/i.test(new URL(initialUrl).hostname)) {
-        function hidePlayerAd() {
-            document.querySelectorAll('iframe[title="advertisement"]').forEach(function (frame) {
-                const overlay = frame.closest('div.absolute.inset-0');
-                if (!overlay || !Array.from(overlay.querySelectorAll('button')).some(function (button) {
-                    return button.textContent.trim() === 'بستن تبلیغ';
-                })) return;
-                overlay.style.setProperty('display', 'none', 'important');
-            });
-        }
-        hidePlayerAd();
-        new MutationObserver(hidePlayerAd).observe(document, { childList: true, subtree: true });
     }
 
     function resolveUrl(value) {
@@ -250,25 +227,6 @@ const getInjectedScript = (currentUrl: string): string => `
         const target = resolveUrl(link.getAttribute('href'));
         if (target) { event.preventDefault(); window.parent.postMessage({ type: 'ENGINE_NEW_TAB', target, activate: event.shiftKey }, '*'); }
     });
-
-    // This site's search form has no action; its React handler normally builds
-    // /search?q=... itself. Route it before React so it also works when the
-    // client-side router cannot operate under the proxy URL.
-    document.addEventListener('submit', function (event) {
-        const form = event.target.closest?.('form[role="search"]');
-        const hostname = new URL(currentUrl()).hostname.toLowerCase();
-        if (!form || (hostname !== 'porniran.com' && hostname !== 'www.porniran.com') ||
-            form.hasAttribute('action') || (form.method || 'get').toLowerCase() !== 'get') return;
-        const query = new FormData(form).get('q');
-        if (typeof query !== 'string') return;
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        const value = query.trim();
-        if (!value) return;
-        const target = new URL('/search', currentUrl());
-        target.searchParams.set('q', value);
-        navigate(target.href);
-    }, true);
 
     document.addEventListener('submit', function (event) {
         const form = event.target.closest('form');
